@@ -323,18 +323,30 @@ function getUDPSocket(name, socket1, socket2, callback) {
 
         obj.m_udpproxy = new udp_proxy("0.0.0.0", socket1.port, "0.0.0.0", socket2.port, (enabled) => {
             const ms = obj.m_udpproxy.getConfig();
+            obj.last_access = Date.now();
             ms.en = enabled;
             startReaper();
             callback(ms);
         });
     } else {
         // This unit has already a socket
-        const ms = m_activeUdpProxy[name].m_udpproxy.getConfig();
+        const obj = m_activeUdpProxy[name];
+
+        if (!obj.m_udpproxy || !obj.m_udpproxy.isReady()) {
+            closeUDPSocket(name, () => {
+                getUDPSocket(name, socket1, socket2, callback);
+            });
+            return;
+        }
+
+        obj.last_access = Date.now();
+        const ms = obj.m_udpproxy.getConfig();
 
         if ((socket1.port === 0 || ms.socket1.port === socket1.port) && (socket2.port === 0 || ms.socket2.port === socket2.port)) {
             // Same socket same configuration.
             ms.last_access = Date.now();
             ms.en = true;
+            startReaper();
             callback(ms);
         } else {
             // Close unit old socket
