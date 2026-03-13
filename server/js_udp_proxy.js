@@ -10,12 +10,16 @@
 const dgram = require('dgram');
 const fs = require('fs');
 const os = require('os');
+const path = require('path');
 
 const PROXY_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const REAPER_INTERVAL_MS = 60 * 1000; // Check every 1 minute
 
 const UDP_RECV_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB receive buffer
 const UDP_SEND_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB send buffer
+const UDP_PROXY_PORT_RANGE_MIN_DEFAULT = 62000;
+const UDP_PROXY_PORT_RANGE_MAX_DEFAULT = 65534;
+const UDP_PROXY_STICKY_PORT_MAP_FILE_DEFAULT = path.join(__dirname, '..', 'cache', 'udpproxy_ports.json');
 
 /**
  * Checks and attempts to fix Linux kernel UDP buffer size limits.
@@ -254,7 +258,180 @@ class udp_proxy {
 }
 
 const m_activeUdpProxy = {};
+const m_stickyUdpPortMap = Object.create(null);
+let m_stickyUdpPortMapLoaded = false;
 let m_reaperInterval = null;
+
+function parsePort(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    const p = Math.trunc(n);
+    if (p <= 0 || p > 65535) return 0;
+    return p;
+}
+
+function getStickyPortMapFilePath() {
+    const fromConfig = global?.m_serverconfig?.m_configuration?.udpproxy_sticky_port_map_file;
+    if (typeof fromConfig === 'string' && fromConfig.trim() !== '') {
+        if (path.isAbsolute(fromConfig)) return fromConfig;
+        return path.join(__dirname, '..', fromConfig);
+    }
+    return UDP_PROXY_STICKY_PORT_MAP_FILE_DEFAULT;
+}
+
+function getPortRange() {
+    const cfg = global?.m_serverconfig?.m_configuration || {};
+    let min = parsePort(cfg.udpproxy_port_range_min);
+    let max = parsePort(cfg.udpproxy_port_range_max);
+    if (min === 0) min = UDP_PROXY_PORT_RANGE_MIN_DEFAULT;
+    if (max === 0) max = UDP_PROXY_PORT_RANGE_MAX_DEFAULT;
+    if (max < min) {
+        const t = min;
+        min = max;
+        max = t;
+    }
+    if ((min % 2) !== 0) min += 1;
+    if (max < (min + 1)) {
+        min = UDP_PROXY_PORT_RANGE_MIN_DEFAULT;
+        max = UDP_PROXY_PORT_RANGE_MAX_DEFAULT;
+    }
+    return { min, max };
+}
+
+function loadStickyPortMap() {
+    if (m_stickyUdpPortMapLoaded) return;
+    m_stickyUdpPortMapLoaded = true;
+    const filePath = getStickyPortMapFilePath();
+    try {
+        if (!fs.existsSync(filePath)) return;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return;
+        Object.keys(parsed).forEach((name) => {
+            const item = parsed[name] || {};
+            const socket1 = parsePort(item.socket1);
+            const socket2 = parsePort(item.socket2);
+            if (socket1 > 0 && socket2 > 0 && socket1 !== socket2) {
+                m_stickyUdpPortMap[name] = { socket1, socket2 };
+            }
+        });
+    } catch (err) {
+        console.error('Failed to load sticky UDP proxy port map:', err?.message || err);
+    }
+}
+
+function saveStickyPortMap() {
+    const filePath = getStickyPortMapFilePath();
+    try {
+        const dirPath = path.dirname(filePath);
+        fs.mkdirSync(dirPath, { recursive: true });
+        const ordered = {};
+        Object.keys(m_stickyUdpPortMap).sort().forEach((name) => {
+            ordered[name] = m_stickyUdpPortMap[name];
+        });
+        fs.writeFileSync(filePath, JSON.stringify(ordered, null, 2), 'utf8');
+    } catch (err) {
+        console.error('Failed to save sticky UDP proxy port map:', err?.message || err);
+    }
+}
+
+function buildReservedPortSet(excludeName) {
+    const used = new Set();
+
+    Object.keys(m_stickyUdpPortMap).forEach((name) => {
+        if (name === excludeName) return;
+        const rec = m_stickyUdpPortMap[name];
+        if (!rec) return;
+        const p1 = parsePort(rec.socket1);
+        const p2 = parsePort(rec.socket2);
+        if (p1 > 0) used.add(p1);
+        if (p2 > 0) used.add(p2);
+    });
+
+    Object.keys(m_activeUdpProxy).forEach((name) => {
+        if (name === excludeName) return;
+        const entry = m_activeUdpProxy[name];
+        const cfg = entry?.m_udpproxy?.getConfig?.();
+        const p1 = parsePort(cfg?.socket1?.port);
+        const p2 = parsePort(cfg?.socket2?.port);
+        if (p1 > 0) used.add(p1);
+        if (p2 > 0) used.add(p2);
+    });
+
+    return used;
+}
+
+function hashString32(value) {
+    const text = String(value || '');
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+}
+
+function findStablePortPairForName(name, reservedPorts) {
+    const range = getPortRange();
+    const pairsCount = Math.floor((range.max - range.min + 1) / 2);
+    if (pairsCount <= 0) {
+        return { socket1: 0, socket2: 0 };
+    }
+
+    const seed = hashString32(name) % pairsCount;
+    for (let i = 0; i < pairsCount; i++) {
+        const pairIndex = (seed + i) % pairsCount;
+        const socket1 = range.min + (pairIndex * 2);
+        const socket2 = socket1 + 1;
+        if (socket2 > range.max) continue;
+        if (reservedPorts.has(socket1) || reservedPorts.has(socket2)) continue;
+        return { socket1, socket2 };
+    }
+
+    return { socket1: 0, socket2: 0 };
+}
+
+function resolveStickyPortPair(name, socket1Port, socket2Port) {
+    const allowFixedPort = global?.m_serverconfig?.m_configuration?.allow_udpproxy_fixed_port === true;
+    if (allowFixedPort !== true) {
+        return {
+            socket1: parsePort(socket1Port),
+            socket2: parsePort(socket2Port)
+        };
+    }
+
+    loadStickyPortMap();
+
+    let p1 = parsePort(socket1Port);
+    let p2 = parsePort(socket2Port);
+    const sticky = m_stickyUdpPortMap[name];
+
+    if (p1 === 0 && sticky?.socket1) p1 = parsePort(sticky.socket1);
+    if (p2 === 0 && sticky?.socket2) p2 = parsePort(sticky.socket2);
+
+    const reserved = buildReservedPortSet(name);
+
+    if ((p1 > 0 && reserved.has(p1)) || (p2 > 0 && reserved.has(p2)) || (p1 > 0 && p1 === p2)) {
+        p1 = 0;
+        p2 = 0;
+    }
+
+    if (p1 === 0 || p2 === 0) {
+        const autoPair = findStablePortPairForName(name, reserved);
+        if (p1 === 0) p1 = autoPair.socket1;
+        if (p2 === 0) p2 = autoPair.socket2;
+    }
+
+    if (p1 > 0 && p2 > 0 && p1 !== p2) {
+        const prev = m_stickyUdpPortMap[name];
+        if (!prev || prev.socket1 !== p1 || prev.socket2 !== p2) {
+            m_stickyUdpPortMap[name] = { socket1: p1, socket2: p2 };
+            saveStickyPortMap();
+        }
+    }
+
+    return { socket1: p1, socket2: p2 };
+}
 
 function startReaper() {
     if (m_reaperInterval) return;
@@ -313,6 +490,18 @@ function closeUDPSocket(name, callback) {
 }
 
 function getUDPSocket(name, socket1, socket2, callback) {
+    const requestedSocket1 = socket1 || {};
+    const requestedSocket2 = socket2 || {};
+    const resolvedPorts = resolveStickyPortPair(name, requestedSocket1.port, requestedSocket2.port);
+    const desiredSocket1 = {
+        address: requestedSocket1.address || '0.0.0.0',
+        port: resolvedPorts.socket1
+    };
+    const desiredSocket2 = {
+        address: requestedSocket2.address || '0.0.0.0',
+        port: resolvedPorts.socket2
+    };
+
     if (!m_activeUdpProxy.hasOwnProperty(name) || m_activeUdpProxy[name] == null) {
         // New socket
         const obj = {
@@ -321,7 +510,7 @@ function getUDPSocket(name, socket1, socket2, callback) {
         };
         m_activeUdpProxy[name] = obj;
 
-        obj.m_udpproxy = new udp_proxy("0.0.0.0", socket1.port, "0.0.0.0", socket2.port, (enabled) => {
+        obj.m_udpproxy = new udp_proxy("0.0.0.0", desiredSocket1.port, "0.0.0.0", desiredSocket2.port, (enabled) => {
             const ms = obj.m_udpproxy.getConfig();
             obj.last_access = Date.now();
             ms.en = enabled;
@@ -334,7 +523,7 @@ function getUDPSocket(name, socket1, socket2, callback) {
 
         if (!obj.m_udpproxy || !obj.m_udpproxy.isReady()) {
             closeUDPSocket(name, () => {
-                getUDPSocket(name, socket1, socket2, callback);
+                getUDPSocket(name, desiredSocket1, desiredSocket2, callback);
             });
             return;
         }
@@ -342,7 +531,7 @@ function getUDPSocket(name, socket1, socket2, callback) {
         obj.last_access = Date.now();
         const ms = obj.m_udpproxy.getConfig();
 
-        if ((socket1.port === 0 || ms.socket1.port === socket1.port) && (socket2.port === 0 || ms.socket2.port === socket2.port)) {
+        if ((desiredSocket1.port === 0 || ms.socket1.port === desiredSocket1.port) && (desiredSocket2.port === 0 || ms.socket2.port === desiredSocket2.port)) {
             // Same socket same configuration.
             ms.last_access = Date.now();
             ms.en = true;
@@ -351,7 +540,7 @@ function getUDPSocket(name, socket1, socket2, callback) {
         } else {
             // Close unit old socket
             closeUDPSocket(name, () => {
-                getUDPSocket(name, socket1, socket2, callback); // Recursive to create a new one after deleting the current.
+                getUDPSocket(name, desiredSocket1, desiredSocket2, callback); // Recursive to create a new one after deleting the current.
             });
         }
     }
