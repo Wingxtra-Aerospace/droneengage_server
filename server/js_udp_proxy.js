@@ -128,11 +128,9 @@ class udp_socket {
         });
 
         this._server.on('error', (err) => {
-            if (err.code === 'EADDRINUSE') {
-                console.log('UDP Listener Cannot Open ' + this._host + ' at port ' + this._port);
-                this._isReady = false;
-                this.parent._onReady(this.parent, this._isReady);
-            }
+            console.log('UDP Listener Cannot Open ' + this._host + ' at port ' + this._port + ' code=' + (err.code || 'UNKNOWN'));
+            this._isReady = false;
+            this.parent._onReady(this.parent, this._isReady);
             console.log("socket error: " + err);
         });
 
